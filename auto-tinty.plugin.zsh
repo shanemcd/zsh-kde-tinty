@@ -107,26 +107,15 @@ tinty_portal_zle_init() {
   # DBus watcher — monitors portal for color-scheme changes
   {
     local last_applied=""
-    "$DBUS_MONITOR" --session "type='signal',interface='org.freedesktop.portal.Settings',member='SettingChanged'" |
+    "$DBUS_MONITOR" --session "type='signal',interface='org.freedesktop.portal.Settings',member='SettingChanged',arg0='org.freedesktop.appearance',arg1='color-scheme'" |
     while read -r line; do
-      if [[ "$line" == *"org.freedesktop.appearance"* ]]; then
-        # Read next few lines to find color-scheme
-        local check_next=5
-        while ((check_next > 0)); do
-          read -r line
-          ((check_next--))
-          if [[ "$line" == *"color-scheme"* ]]; then
-            sleep 0.2  # Wait for signals to settle
-            local scheme=$(_tinty_get_current_scheme)
+      sleep 0.2  # Wait for signals to settle
+      local scheme=$(_tinty_get_current_scheme)
 
-            # Only apply if different from last (debounce duplicates)
-            if [[ -n "$scheme" && "$scheme" != "$last_applied" ]]; then
-              last_applied="$scheme"
-              _tinty_apply_for_scheme "$scheme" &!
-            fi
-            break
-          fi
-        done
+      # Only apply if different from last (debounce duplicates)
+      if [[ -n "$scheme" && "$scheme" != "$last_applied" ]]; then
+        last_applied="$scheme"
+        _tinty_apply_for_scheme "$scheme" &!
       fi
     done
   } >/dev/null 2>&1 &
