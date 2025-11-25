@@ -16,10 +16,31 @@ _tinty_apply_for_scheme() {
   {
     flock -n 9 || exit 0  # If another tab is applying, skip
 
+    # Get tinty output once
+    local tinty_output
     if [[ "$color_scheme" == "1" ]]; then
-      $TINTY_BIN apply "$ZSH_TINTY_DARK" > /dev/tty 2>/dev/null
+      tinty_output=$($TINTY_BIN apply "$ZSH_TINTY_DARK" 2>/dev/null)
     else
-      $TINTY_BIN apply "$ZSH_TINTY_LIGHT" > /dev/tty 2>/dev/null
+      tinty_output=$($TINTY_BIN apply "$ZSH_TINTY_LIGHT" 2>/dev/null)
+    fi
+
+    # Apply only to registered shells (those that loaded this plugin)
+    if [[ -d /tmp/tinty-shells ]]; then
+      for pts_num in /tmp/tinty-shells/*; do
+        [[ -e "$pts_num" ]] || continue
+        local pts="/dev/pts/$(basename "$pts_num")"
+
+        # Verify the shell is still running
+        local shell_pid=$(cat "$pts_num" 2>/dev/null)
+        if [[ -n "$shell_pid" ]] && kill -0 "$shell_pid" 2>/dev/null; then
+          if [[ -w "$pts" && -c "$pts" ]]; then
+            printf '%s' "$tinty_output" > "$pts" 2>/dev/null
+          fi
+        else
+          # Clean up stale registration
+          rm -f "$pts_num"
+        fi
+      done
     fi
   } 9>/tmp/tinty-portal.lock
 }
@@ -58,16 +79,58 @@ tinty_portal_zle_init() {
   export ZSH_TINTY_LIGHT="${ZSH_TINTY_LIGHT:-base16-ia-light}"
   export ZSH_TINTY_DARK="${ZSH_TINTY_DARK:-base16-ia-dark}"
 
-  # Initial application - get current scheme and apply
-  {
+  # Register this shell's TTY so only plugin-aware terminals get theme updates
+  local my_tty=$(tty 2>/dev/null)
+
+  # Try multiple fallbacks to find the actual pts device
+  if [[ ! "$my_tty" =~ ^/dev/pts/([0-9]+)$ ]]; then
+    # Try fd 0, 1, 2 in order
+    for fd in 0 1 2; do
+      my_tty=$(readlink /proc/self/fd/$fd 2>/dev/null)
+      [[ "$my_tty" =~ ^/dev/pts/([0-9]+)$ ]] && break
+    done
+  fi
+
+  # Final fallback: use ps to get the controlling terminal
+  if [[ ! "$my_tty" =~ ^/dev/pts/([0-9]+)$ ]]; then
+    local ctty=$(ps -p $$ -o tty= 2>/dev/null | tr -d ' ')
+    if [[ "$ctty" =~ ^pts/([0-9]+)$ ]]; then
+      my_tty="/dev/$ctty"
+    fi
+  fi
+
+  local my_pts_num=""
+  if [[ -n "$my_tty" && "$my_tty" =~ ^/dev/pts/([0-9]+)$ ]]; then
+    my_pts_num="${match[1]}"
+    mkdir -p /tmp/tinty-shells
+    echo $$ > "/tmp/tinty-shells/$my_pts_num"
+  fi
+
+  # Clean up registration on exit - but ONLY for the main shell, not subshells/background jobs
+  tinty_cleanup_registration() {
+    # Only clean up if this is the top-level shell (not a subshell or background job)
+    # $ZSH_SUBSHELL is 0 in the main shell, >0 in subshells
+    if [[ $ZSH_SUBSHELL -eq 0 && -n "$my_pts_num" ]]; then
+      rm -f "/tmp/tinty-shells/$my_pts_num"
+    fi
+  }
+  add-zsh-hook zshexit tinty_cleanup_registration
+
+  # Initial application - apply directly to this terminal (not via broadcast)
+  if [[ -n "$my_tty" ]]; then
     local current_scheme=$(_tinty_get_current_scheme)
     if [[ -n "$current_scheme" ]]; then
-      _tinty_apply_for_scheme "$current_scheme"
+      if [[ "$current_scheme" == "1" ]]; then
+        $TINTY_BIN apply "$ZSH_TINTY_DARK" > "$my_tty" 2>/dev/null
+      else
+        $TINTY_BIN apply "$ZSH_TINTY_LIGHT" > "$my_tty" 2>/dev/null
+      fi
     fi
-  } &!
+  fi
 
   # DBus watcher — monitors freedesktop portal for color-scheme changes
   {
+    local last_applied=""
     "$DBUS_MONITOR" --session "type='signal',interface='org.freedesktop.portal.Settings',member='SettingChanged'" |
     while read -r line; do
       # Look for org.freedesktop.appearance namespace
@@ -78,12 +141,16 @@ tinty_portal_zle_init() {
           read -r line
           ((check_next--))
           if [[ "$line" == *"color-scheme"* ]]; then
-            # Next line should have the value
-            read -r line
-            if [[ "$line" =~ uint32[[:space:]]+([0-9]+) ]]; then
-              _tinty_apply_for_scheme "${match[1]}" &!
-              break
+            # Wait 200ms for signals to settle, then poll actual value
+            sleep 0.2
+            local current_scheme=$(_tinty_get_current_scheme)
+
+            # Only apply if different from last applied (debounce duplicates)
+            if [[ -n "$current_scheme" && "$current_scheme" != "$last_applied" ]]; then
+              last_applied="$current_scheme"
+              _tinty_apply_for_scheme "$current_scheme" &!
             fi
+            break
           fi
         done
       fi
