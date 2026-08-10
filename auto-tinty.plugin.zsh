@@ -3,8 +3,8 @@
 #
 # Architecture:
 # - One shell instance runs the watcher (detects OS theme changes)
-# - Watcher signals all shells via USR1 when theme changes
-# - Each shell runs `tinty apply` for itself (terminal-agnostic)
+# - Linux: watcher signals all shells via USR1; each shell runs `tinty apply`
+# - macOS: watcher runs `tinty apply` once (Ghostty/iTerm hooks update all windows)
 
 # Debug logging
 _tinty_debug() {
@@ -17,7 +17,7 @@ if [[ ! -t 0 || -z "$TERM" || "$TERM" == "dumb" ]]; then
   return
 fi
 
-_tinty_debug "START: OSTYPE=$OSTYPE, TERM=$TERM, PID=$$"
+_tinty_debug "START: OSTYPE=$OSTYPE, TERM=$TERM, TERM_PROGRAM=${TERM_PROGRAM:-}, PID=$$"
 
 # Safe initialization once ZLE is active & PATH is ready
 autoload -Uz add-zle-hook-widget
@@ -43,21 +43,30 @@ _tinty_get_current_scheme() {
   fi
 }
 
-# Apply theme to THIS shell's terminal
-_tinty_apply_current_scheme() {
-  local scheme=$(_tinty_get_current_scheme)
-  local theme=$(_tinty_theme_for_scheme "$scheme")
-  _tinty_debug "APPLY: scheme=$scheme, theme=$theme to tty=$TTY"
+# Run tinty apply. On Linux, also write any OSC output to this shell's TTY.
+# On macOS, tinty hooks (Ghostty SIGUSR2 / iTerm AppleScript) update terminals
+# without needing stdout, so we only need to invoke tinty once.
+_tinty_apply_theme() {
+  local theme=$1
+  _tinty_debug "APPLY: theme=$theme tty=${TTY:-none} term_program=${TERM_PROGRAM:-}"
 
-  # Capture output and write to TTY to ensure it reaches the terminal
-  # (signal handlers may not have stdout connected properly)
-  local output=$($TINTY_BIN apply "$theme" 2>/dev/null)
-  if [[ -n "$output" && -w "$TTY" ]]; then
-    printf '%s' "$output" > "$TTY"
+  if [[ "$OSTYPE" == darwin* ]]; then
+    $TINTY_BIN apply "$theme" >/dev/null 2>&1
+  else
+    local output=$($TINTY_BIN apply "$theme" 2>/dev/null)
+    if [[ -n "$output" && -n "$TTY" && -w "$TTY" ]]; then
+      printf '%s' "$output" > "$TTY"
+    fi
   fi
 }
 
-# Signal handler: apply theme when notified
+_tinty_apply_current_scheme() {
+  local scheme=$(_tinty_get_current_scheme)
+  [[ -z "$scheme" ]] && return 1
+  _tinty_apply_theme "$(_tinty_theme_for_scheme "$scheme")"
+}
+
+# Linux: each shell applies when signaled
 TRAPUSR1() {
   _tinty_debug "SIGUSR1: received, applying theme"
   _tinty_apply_current_scheme
@@ -77,6 +86,24 @@ _tinty_signal_all_shells() {
       rm -f "$pidfile"
     fi
   done
+}
+
+_tinty_acquire_watcher_lock() {
+  # Clean up stale watcher lock
+  if [[ -d /tmp/tinty-watcher.lock ]]; then
+    local lock_mtime
+    if [[ "$OSTYPE" == darwin* ]]; then
+      lock_mtime=$(stat -f %m /tmp/tinty-watcher.lock 2>/dev/null || echo 0)
+    else
+      lock_mtime=$(stat -c %Y /tmp/tinty-watcher.lock 2>/dev/null || echo 0)
+    fi
+    local lock_age=$(( $(date +%s) - lock_mtime ))
+    if (( lock_age > 60 )); then
+      _tinty_debug "ZLE_INIT: removing stale watcher lock (age=${lock_age}s)"
+      rmdir /tmp/tinty-watcher.lock 2>/dev/null
+    fi
+  fi
+  mkdir /tmp/tinty-watcher.lock 2>/dev/null
 }
 
 tinty_portal_zle_init() {
@@ -121,7 +148,7 @@ tinty_portal_zle_init() {
   export ZSH_TINTY_LIGHT="${ZSH_TINTY_LIGHT:-base16-ia-light}"
   export ZSH_TINTY_DARK="${ZSH_TINTY_DARK:-base16-ia-dark}"
 
-  # Register this shell for signaling (use PID as key for simplicity)
+  # Register this shell (used on Linux for USR1 fan-out)
   mkdir -p /tmp/tinty-shells
   echo $$ > "/tmp/tinty-shells/$$"
   _tinty_debug "ZLE_INIT: registered shell PID $$ in /tmp/tinty-shells/$$"
@@ -130,7 +157,10 @@ tinty_portal_zle_init() {
   _tinty_cleanup() {
     if [[ $ZSH_SUBSHELL -eq 0 ]]; then
       rm -f "/tmp/tinty-shells/$$"
-      [[ -n "$TINTY_WATCHER_PID" ]] && kill "$TINTY_WATCHER_PID" 2>/dev/null
+      if [[ -n "$TINTY_WATCHER_PID" ]]; then
+        kill "$TINTY_WATCHER_PID" 2>/dev/null
+        rmdir /tmp/tinty-watcher.lock 2>/dev/null
+      fi
     fi
   }
   add-zsh-hook zshexit _tinty_cleanup
@@ -139,13 +169,17 @@ tinty_portal_zle_init() {
   _tinty_debug "ZLE_INIT: applying initial theme"
   _tinty_apply_current_scheme
 
-  # Start platform-specific watcher
+  # Start platform-specific watcher (single instance across shells)
+  if ! _tinty_acquire_watcher_lock; then
+    _tinty_debug "ZLE_INIT: another shell is the watcher"
+    return 0
+  fi
+
+  _tinty_debug "ZLE_INIT: acquired watcher lock, starting watcher"
   if [[ "$OSTYPE" == darwin* ]]; then
-    # macOS: each shell runs its own watcher
-    # Capture TTY before backgrounding so the watcher knows which terminal to update
-    local my_tty=$TTY
+    # macOS: one watcher runs tinty apply (hooks update all Ghostty/iTerm windows)
     {
-      _tinty_debug "WATCHER: macOS watcher starting for tty=$my_tty"
+      _tinty_debug "WATCHER: macOS watcher starting"
       local last_scheme=$(_tinty_get_current_scheme)
       _tinty_debug "WATCHER: initial scheme=$last_scheme"
       "$WATCHER_BIN" --include AppleInterfaceThemeChangedNotification 2>&1 |
@@ -156,56 +190,37 @@ tinty_portal_zle_init() {
         if [[ -n "$scheme" && "$scheme" != "$last_scheme" ]]; then
           last_scheme="$scheme"
           local theme=$(_tinty_theme_for_scheme "$scheme")
-          _tinty_debug "WATCHER: scheme changed to $scheme, theme=$theme, applying to $my_tty"
-          # Run tinty with output redirected to our specific TTY
-          $TINTY_BIN apply "$theme" > "$my_tty" 2>/dev/null
+          _tinty_debug "WATCHER: scheme changed to $scheme, applying $theme"
+          _tinty_apply_theme "$theme"
         fi
       done
-      _tinty_debug "WATCHER: exited"
+      rmdir /tmp/tinty-watcher.lock 2>/dev/null
+      _tinty_debug "WATCHER: exited, released lock"
     } &
-    TINTY_WATCHER_PID=$!
-    _tinty_debug "ZLE_INIT: watcher started with PID=$TINTY_WATCHER_PID"
-    disown
   else
-    # Linux: single watcher signals all shells (tinty outputs escape sequences
-    # that we capture and could broadcast, but signals are cleaner)
-    _tinty_debug "ZLE_INIT: attempting to become watcher..."
-
-    # Clean up stale watcher lock
-    if [[ -d /tmp/tinty-watcher.lock ]]; then
-      local lock_age=$(( $(date +%s) - $(stat -c %Y /tmp/tinty-watcher.lock 2>/dev/null || echo 0) ))
-      if (( lock_age > 60 )); then
-        _tinty_debug "ZLE_INIT: removing stale watcher lock (age=${lock_age}s)"
-        rmdir /tmp/tinty-watcher.lock 2>/dev/null
-      fi
-    fi
-
-    if mkdir /tmp/tinty-watcher.lock 2>/dev/null; then
-      _tinty_debug "ZLE_INIT: acquired watcher lock, starting watcher"
-      {
-        _tinty_debug "WATCHER: Linux watcher starting"
-        local last_scheme=$(_tinty_get_current_scheme)
-        _tinty_debug "WATCHER: initial scheme=$last_scheme"
-        "$WATCHER_BIN" --session "type='signal',interface='org.freedesktop.portal.Settings',member='SettingChanged',arg0='org.freedesktop.appearance',arg1='color-scheme'" 2>&1 |
-        while read -r line; do
-          sleep 0.2  # Debounce
-          local scheme=$(_tinty_get_current_scheme)
-          if [[ -n "$scheme" && "$scheme" != "$last_scheme" ]]; then
-            last_scheme="$scheme"
-            _tinty_debug "WATCHER: scheme changed to $scheme, signaling shells"
-            _tinty_signal_all_shells
-          fi
-        done
-        rmdir /tmp/tinty-watcher.lock 2>/dev/null
-        _tinty_debug "WATCHER: exited, released lock"
-      } &
-      TINTY_WATCHER_PID=$!
-      _tinty_debug "ZLE_INIT: watcher started with PID=$TINTY_WATCHER_PID"
-      disown
-    else
-      _tinty_debug "ZLE_INIT: another shell is the watcher, will receive signals"
-    fi
+    # Linux: one watcher signals all shells to apply locally
+    {
+      _tinty_debug "WATCHER: Linux watcher starting"
+      local last_scheme=$(_tinty_get_current_scheme)
+      _tinty_debug "WATCHER: initial scheme=$last_scheme"
+      "$WATCHER_BIN" --session "type='signal',interface='org.freedesktop.portal.Settings',member='SettingChanged',arg0='org.freedesktop.appearance',arg1='color-scheme'" 2>&1 |
+      while read -r line; do
+        sleep 0.2  # Debounce
+        local scheme=$(_tinty_get_current_scheme)
+        if [[ -n "$scheme" && "$scheme" != "$last_scheme" ]]; then
+          last_scheme="$scheme"
+          _tinty_debug "WATCHER: scheme changed to $scheme, signaling shells"
+          _tinty_signal_all_shells
+        fi
+      done
+      rmdir /tmp/tinty-watcher.lock 2>/dev/null
+      _tinty_debug "WATCHER: exited, released lock"
+    } &
   fi
+
+  TINTY_WATCHER_PID=$!
+  _tinty_debug "ZLE_INIT: watcher started with PID=$TINTY_WATCHER_PID"
+  disown
 }
 
 # Run watcher only after ZLE has fully initialized (cursor is set, prompt ready)
