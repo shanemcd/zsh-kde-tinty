@@ -46,9 +46,35 @@ _tinty_get_current_scheme() {
 # Run tinty apply. On Linux, also write any OSC output to this shell's TTY.
 # On macOS, tinty hooks (Ghostty SIGUSR2 / iTerm AppleScript) update terminals
 # without needing stdout, so we only need to invoke tinty once.
+# A short-lived mkdir mutex (with stale-owner reaping) serializes applies so
+# multiple watchers/tabs can never clobber each other with different themes.
+_tinty_acquire_apply_lock() {
+  local lock=/tmp/tinty-apply.lock
+  for _ in 1 2 3 4 5; do
+    if mkdir "$lock" 2>/dev/null; then
+      echo $$ > "$lock/pid"
+      return 0
+    fi
+    # Reap stale owner (dead pid) before giving up
+    local owner=$(cat "$lock/pid" 2>/dev/null || echo 0)
+    if [[ -z "$owner" ]] || ! kill -0 "$owner" 2>/dev/null; then
+      rm -rf "$lock" 2>/dev/null
+      continue
+    fi
+    sleep 0.2
+  done
+  return 1
+}
+_tinty_release_apply_lock() {
+  rm -f /tmp/tinty-apply.lock/pid 2>/dev/null
+  rmdir /tmp/tinty-apply.lock 2>/dev/null
+}
 _tinty_apply_theme() {
   local theme=$1
   _tinty_debug "APPLY: theme=$theme tty=${TTY:-none} term_program=${TERM_PROGRAM:-}"
+
+  # Only one apply in flight at a time (across all tabs/watchers).
+  _tinty_acquire_apply_lock || { _tinty_debug "APPLY: skipped (another apply in progress)"; return 0; }
 
   if [[ "$OSTYPE" == darwin* ]]; then
     $TINTY_BIN apply "$theme" >/dev/null 2>&1
@@ -58,6 +84,8 @@ _tinty_apply_theme() {
       printf '%s' "$output" > "$TTY"
     fi
   fi
+
+  _tinty_release_apply_lock
 }
 
 _tinty_apply_current_scheme() {
@@ -89,21 +117,24 @@ _tinty_signal_all_shells() {
 }
 
 _tinty_acquire_watcher_lock() {
-  # Clean up stale watcher lock
-  if [[ -d /tmp/tinty-watcher.lock ]]; then
-    local lock_mtime
-    if [[ "$OSTYPE" == darwin* ]]; then
-      lock_mtime=$(stat -f %m /tmp/tinty-watcher.lock 2>/dev/null || echo 0)
-    else
-      lock_mtime=$(stat -c %Y /tmp/tinty-watcher.lock 2>/dev/null || echo 0)
+  local lock=/tmp/tinty-watcher.lock
+  for _ in 1 2 3; do
+    if mkdir "$lock" 2>/dev/null; then
+      echo $$ > "$lock/pid"  # This shell is the watcher
+      return 0
     fi
-    local lock_age=$(( $(date +%s) - lock_mtime ))
-    if (( lock_age > 60 )); then
-      _tinty_debug "ZLE_INIT: removing stale watcher lock (age=${lock_age}s)"
-      rmdir /tmp/tinty-watcher.lock 2>/dev/null
+    # Lock held — only steal it if the recorded owner PID is dead.
+    # (Never treat a live, long-running watcher as "stale" by age, which is
+    # what allowed new tabs to spawn a second macwatch.)
+    local owner=$(cat "$lock/pid" 2>/dev/null || echo 0)
+    if [[ -z "$owner" ]] || ! kill -0 "$owner" 2>/dev/null; then
+      _tinty_debug "ZLE_INIT: reaping dead watcher owner ($owner)"
+      rm -rf "$lock" 2>/dev/null
+      continue
     fi
-  fi
-  mkdir /tmp/tinty-watcher.lock 2>/dev/null
+    return 1  # A live watcher owns the lock
+  done
+  return 1
 }
 
 tinty_portal_zle_init() {
@@ -159,7 +190,7 @@ tinty_portal_zle_init() {
       rm -f "/tmp/tinty-shells/$$"
       if [[ -n "$TINTY_WATCHER_PID" ]]; then
         kill "$TINTY_WATCHER_PID" 2>/dev/null
-        rmdir /tmp/tinty-watcher.lock 2>/dev/null
+        rm -rf /tmp/tinty-watcher.lock 2>/dev/null
       fi
     fi
   }
@@ -194,7 +225,7 @@ tinty_portal_zle_init() {
           _tinty_apply_theme "$theme"
         fi
       done
-      rmdir /tmp/tinty-watcher.lock 2>/dev/null
+      rm -rf /tmp/tinty-watcher.lock 2>/dev/null
       _tinty_debug "WATCHER: exited, released lock"
     } &
   else
@@ -213,7 +244,7 @@ tinty_portal_zle_init() {
           _tinty_signal_all_shells
         fi
       done
-      rmdir /tmp/tinty-watcher.lock 2>/dev/null
+      rm -rf /tmp/tinty-watcher.lock 2>/dev/null
       _tinty_debug "WATCHER: exited, released lock"
     } &
   fi
